@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Ultimate Battle Royale - Custom Map Edition</title>
+<style>
+  html,body{height:100%;margin:0;background:#0b0b0b;overflow:hidden;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  #root{width:100%;height:100%;position:relative;touch-action:none}
+  canvas{display:block}
+  /* HUD */
+  .hud{position:absolute;left:12px;top:12px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.8);z-index:20}
+  .hud .row{margin-bottom:6px}
+  #mini{position:absolute;right:12px;top:12px;width:140px;height:140px;border-radius:8px;background:rgba(0,0,0,.45);z-index:20;padding:6px;color:#fff;font-size:12px}
+  #controls{position:absolute;left:50%;transform:translateX(-50%);bottom:10px;display:flex;gap:8px;z-index:40}
+  .btn{background:rgba(255,255,255,.07);color:white;padding:10px;border-radius:10px;min-width:44px;text-align:center;font-size:13px;user-select:none}
+  #leftStick{position:absolute;left:12px;bottom:12px;width:120px;height:120px;border-radius:50%;background:rgba(255,255,255,.04);z-index:40;touch-action:none}
+  #rightStick{position:absolute;right:12px;bottom:12px;width:120px;height:120px;border-radius:50%;background:rgba(255,255,255,.04);z-index:40;touch-action:none}
+  /* fullscreen overlay menus */
+  .menu{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,rgba(0,0,0,.6),rgba(0,0,0,.8));z-index:60}
+  .panel{background:#111;color:#fff;padding:18px;border-radius:10px;min-width:260px;text-align:center}
+  .muted{opacity:.8;font-size:13px}
+  #fps{position:absolute;left:12px;bottom:12px;color:#fff;z-index:30;font-size:12px}
+  #loadingStatus {margin-top: 10px; color: #ffca28; font-size: 13px;}
+</style>
+
+<!-- Import map (Three.js from esm.sh) -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://esm.sh/three@0.155.0",
+    "three/examples/jsm/controls/OrbitControls": "https://esm.sh/three@0.155.0/examples/jsm/controls/OrbitControls",
+    "three/examples/jsm/loaders/GLTFLoader": "https://esm.sh/three@0.155.0/examples/jsm/loaders/GLTFLoader"
+  }
+}
+</script>
+</head>
+<body>
+<div id="root">
+  <div id="hud" class="hud" style="display:none;">
+    <div class="row">Alive: <span id="aliveCount">--</span></div>
+    <div class="row">Zone: <span id="zoneText">--</span></div>
+    <div class="row">Kills: <span id="kills">0</span></div>
+  </div>
+  <div id="mini">Mini-map</div>
+
+  <div id="leftStick"></div>
+  <div id="rightStick"></div>
+
+  <div id="controls">
+    <div class="btn" id="btnFire">Fire</div>
+    <div class="btn" id="btnAim">Aim</div>
+    <div class="btn" id="btnJump">Jump</div>
+    <div class="btn" id="btnCrouch">Crouch</div>
+    <div class="btn" id="btnSprint">Sprint</div>
+    <div class="btn" id="btnReload">Reload</div>
+    <div class="btn" id="btnInventory">Inventory</div>
+  </div>
+
+  <div id="menu" class="menu">
+    <div class="panel">
+      <h2>Battle Royale Prototype</h2>
+      <div class="muted">PUBG-inspired, low-poly, mobile-optimized prototype</div>
+      <div id="loadingStatus">Loading 3D Custom Map Assets... Please wait.</div>
+      <div style="height:12px"></div>
+      <button id="startBtn" class="btn" disabled style="opacity:0.3; pointer-events:none;">Start Match</button>
+      <div style="height:8px"></div>
+      <button id="spectateBtn" class="btn" disabled style="opacity:0.3; pointer-events:none;">Start Spectator</button>
+    </div>
+  </div>
+
+  <div id="fps">FPS: --</div>
+  <div id="crosshair" style="
+    position:absolute;
+    left:50%;
+    top:50%;
+    transform:translate(-50%,-50%);
+    color:white;
+    font-size:28px;
+    z-index:50;
+    pointer-events:none;
+  ">+</div>
+
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader";
+
+// Basic app state
+const ROOT = document.getElementById('root');
+const MENU = document.getElementById('menu');
+const START = document.getElementById('startBtn');
+const SPECTATE = document.getElementById('spectateBtn');
+const HUD = document.getElementById('hud');
+const ALIVE = document.getElementById('aliveCount');
+const ZONE_TXT = document.getElementById('zoneText');
+const KILLS = document.getElementById('kills');
+const FPS_EL = document.getElementById('fps');
+const LOADING_STATUS = document.getElementById('loadingStatus');
+
+let scene, camera, renderer, clock;
+let player, bots = [], pickups = [], vehicles = [];
+let zone = { center: new THREE.Vector2(0,0), radius: 2500, targetRadius: 2500, stage:0, shrinkTimer:45 };
+let match = { started:false, alive:0, kills:0, time:0, isSpectator: false };
+let mobileInput = { left: {x:0,y:0}, right: {x:0,y:0}, aiming:false, firing:false };
+
+// Map Settings & Colliders
+const MAP_SIZE = 4000; 
+const BOT_COUNT = 30; 
+const PICKUP_COUNT = 120;
+const VEHICLE_COUNT = 10;
+let customMapMesh = null;
+let collidableMeshList = [];
+const raycasterY = new THREE.Raycaster();
+const downwardVector = new THREE.Vector3(0, -1, 0);
+
+const rng = (min,max)=>Math.random()*(max-min)+min;
+
+// Step 1: Initialize application base immediately to load custom asset first
+initAppEngine();
+
+function initAppEngine() {
+  clock = new THREE.Clock();
+
+  // Renderer Setup
+  renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  ROOT.appendChild(renderer.domElement);
+
+  // Scene setup
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x87ceeb);
+  scene.fog = new THREE.FogExp2(0x87ceeb, 0.0002);
+
+  // Lighting
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x444455, 1.0);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+  dir.position.set(200, 400, 200);
+  dir.castShadow = true;
+  dir.shadow.mapSize.width = 1024;
+  dir.shadow.mapSize.height = 1024;
+  scene.add(dir);
+
+  // Camera setup
+  camera = new THREE.PerspectiveCamera(65, window.innerWidth/window.innerHeight, 0.1, 10000);
+
+  // Load Custom map.glb immediately before generating anything else
+  const loader = new GLTFLoader();
+  loader.load('./map.glb', (gltf) => {
+    customMapMesh = gltf.scene;
+    customMapMesh.scale.set(18, 18, 18);
+    customMapMesh.position.set(0, -2, 0);
+
+    customMapMesh.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+        collidableMeshList.push(child); // Gather custom terrain meshes for physics calculations
+      }
+    });
+    scene.add(customMapMesh);
+    
+    LOADING_STATUS.style.color = "#4caf50";
+    LOADING_STATUS.textContent = "Custom Map Loaded Successfully! Ready to play.";
+    START.disabled = false;
+    START.style.opacity = "1";
+    START.style.pointerEvents = "auto";
+    SPECTATE.disabled = false;
+    SPECTATE.style.opacity = "1";
+    SPECTATE.style.pointerEvents = "auto";
+  }, undefined, (err) => {
+    console.error('Failed to load custom map.glb:', err);
+    LOADING_STATUS.style.color = "#f44336";
+    LOADING_STATUS.textContent = "Failed to load map.glb file. Falling back to procedural generation.";
+    
+    // Fallback static plane if the user's file path fails locally
+    const fallbackGeo = new THREE.PlaneGeometry(MAP_SIZE, MAP_SIZE);
+    fallbackGeo.rotateX(-Math.PI/2);
+    const fallbackMat = new THREE.MeshStandardMaterial({ color: 0x557a46, flatShading: true });
+    const fallbackFloor = new THREE.Mesh(fallbackGeo, fallbackMat);
+    scene.add(fallbackFloor);
+    collidableMeshList.push(fallbackFloor);
+
+    START.disabled = false;
+    START.style.opacity = "1";
+    START.style.pointerEvents = "auto";
+  });
+
+  window.addEventListener('resize', onResize);
+  setupMobileControls();
+  setupButtons();
+}
+
+function startMatch(spectator = false) {
+  MENU.style.display = 'none';
+  HUD.style.display = 'block';
+  match.isSpectator = spectator;
+
+  // Build actors based dynamically on custom map height configurations
+  player = createPlayer();
+  buildNavGrid();
+
+  for (let i = 0; i < BOT_COUNT; i++) bots.push(createBot(i));
+  for (let i = 0; i < PICKUP_COUNT; i++) pickups.push(createPickup());
+  for (let i = 0; i < VEHICLE_COUNT; i++) vehicles.push(createVehicle());
+
+  if (!spectator) {
+    player.pos.set(0, 400, 0); // Drop straight into the map origin center
+    player.mesh.position.copy(player.pos);
+  } else {
+    player.health = 0;
+    camera.position.set(0, 300, 300);
+  }
+
+  match.started = true;
+  animate();
+}
+
+// True Height Calculation using dynamic 3D Raycasting down onto the 3D Map
+function getMapHeightAt(x, z) {
+  if (collidableMeshList.length === 0) return 0;
+  
+  // Cast a ray from high above looking straight down
+  raycasterY.set(new THREE.Vector3(x, 1000, z), downwardVector);
+  const intersections = raycasterY.intersectObjects(collidableMeshList, true);
+  
+  if (intersections.length > 0) {
+    return intersections[0].point.y;
+  }
+  return 0; // Default floor layout if out-of-bounds
+}
+
+function createPlayer(){
+  const p = {
+    id: 'player',
+    pos: new THREE.Vector3(0, 100, 0),
+    vel: new THREE.Vector3(),
+    yaw: 0, pitch: 0,
+    health: 100,
+    armor: 0,
+    cameraMode: 'first',
+    onGround: false,
+    sprinting: false,
+    crouch: false,
+    lastShotTime: 0
+  };
+  const geom = new THREE.CapsuleGeometry(1, 2, 4, 8);
+  const mat = new THREE.MeshStandardMaterial({color: 0x3f51b5});
+  p.mesh = new THREE.Mesh(geom, mat);
+  p.mesh.castShadow = true;
+  scene.add(p.mesh);
+  return p;
+}
+
+let navPoints = [];
+function buildNavGrid(){
+  navPoints = [];
+  // Sample point locations distributed around the map coordinate boundaries
+  const step = 200;
+  for (let x = -MAP_SIZE/3; x <= MAP_SIZE/3; x += step){
+    for (let z = -MAP_SIZE/3; z <= MAP_SIZE/3; z += step){
+      const groundY = getMapHeightAt(x, z);
+      navPoints.push(new THREE.Vector3(x, groundY, z));
+    }
+  }
+}
+
+function createBot(i){
+  const spawnX = rng(-1000, 1000);
+  const spawnZ = rng(-1000, 1000);
+  const groundY = getMapHeightAt(spawnX, spawnZ);
+
+  const b = {
+    id: 'bot_' + i,
+    pos: new THREE.Vector3(spawnX, groundY + 300, spawnZ), // Start with a drop vector
+    vel: new THREE.Vector3(0, 0, 0),
+    health: 100,
+    skill: Math.random(),
+    target: null,
+    alive: true,
+    lastShotTime: 0
+  };
+  const geom = new THREE.BoxGeometry(2, 4, 2);
+  const mat = new THREE.MeshStandardMaterial({color: new THREE.Color().setHSL(Math.random(), 0.8, 0.4)});
+  b.mesh = new THREE.Mesh(geom, mat);
+  b.mesh.castShadow = true;
+  scene.add(b.mesh);
+  return b;
+}
+
+function createPickup(){
+  const types = ['AR','SMG','SNIPER','MED','ARMOR'];
+  const t = types[Math.floor(rng(0, types.length))];
+  const pX = rng(-1200, 1200);
+  const pZ = rng(-1200, 1200);
+  const pY = getMapHeightAt(pX, pZ) + 1.5;
+
+  const geom = new THREE.BoxGeometry(1.5, 1.5, 1.5);
+  const mat = new THREE.MeshStandardMaterial({color: t==='MED'?0xe53935: t==='ARMOR'?0x1e88e5:0xffb300});
+  const m = new THREE.Mesh(geom, mat);
+  m.position.set(pX, pY, pZ);
+  scene.add(m);
+  return { type: t, pos: new THREE.Vector3(pX, pY, pZ), mesh: m };
+}
+
+function createVehicle(){
+  const vX = rng(-1000, 1000);
+  const vZ = rng(-1000, 1000);
+  const vY = getMapHeightAt(vX, vZ) + 1.2;
+
+  const geom = new THREE.BoxGeometry(5, 2, 3);
+  const mat = new THREE.MeshStandardMaterial({color: 0x37474f});
+  const m = new THREE.Mesh(geom, mat);
+  m.position.set(vX, vY, vZ);
+  scene.add(m);
+  return { pos: new THREE.Vector3(vX, vY, vZ), mesh: m, speed: 0 };
+}
+
+// LOOP ANIMATION
+let frames = 0, fpsTime = 0;
+function animate(){
+  if (!match.started) return;
+  requestAnimationFrame(animate);
+
+  const dt = Math.min(clock.getDelta(), 0.03);
+  match.time += dt;
+
+  updateZone(dt);
+  if (!match.isSpectator) updatePlayer(dt);
+  updateBots(dt);
+  updatePickups(dt);
+  updateCamera();
+
+  renderer.render(scene, camera);
+
+  // Debug Stats Metrics
+  frames++; fpsTime += dt;
+  if (fpsTime > 0.5){
+    FPS_EL.textContent = 'FPS: ' + Math.round(frames / fpsTime);
+    frames = 0; fpsTime = 0;
+  }
+  const livingBots = bots.filter(b => b.alive).length;
+  ALIVE.textContent = livingBots + (player.health > 0 && !match.isSpectator ? 1 : 0);
+  ZONE_TXT.textContent = `${Math.round(zone.radius)}m`;
+  KILLS.textContent = match.kills;
+}
+
+function updateZone(dt){
+  zone.shrinkTimer -= dt;
+  if (zone.shrinkTimer <= 0){
+    zone.stage++;
+    zone.targetRadius = Math.max(50, zone.radius * 0.6);
+    zone.shrinkTimer = 30;
+  }
+  zone.radius += (zone.targetRadius - zone.radius) * (dt * 0.1);
+
+  // Safe checks outside ring bounds
+  if (player && player.health > 0 && !match.isSpectator){
+    const pDist = new THREE.Vector2(player.pos.x, player.pos.z).distanceTo(zone.center);
+    if (pDist > zone.radius) {
+      player.health -= dt * 4;
+      if (player.health <= 0) player.health = 0;
+    }
+  }
+
+  bots.forEach(b => {
+    if (!b.alive) return;
+    const bDist = new THREE.Vector2(b.pos.x, b.pos.z).distanceTo(zone.center);
+    if (bDist > zone.radius) {
+      b.health -= dt * 5;
+      if (b.health <= 0) {
+        b.alive = false;
+        scene.remove(b.mesh);
+      }
+    }
+  });
+}
+
+function updatePlayer(dt){
+  if (!player || player.health <= 0) return;
+
+  // Align direction matrix based on looking direction angles
+  const forward = new THREE.Vector3(Math.cos(player.yaw), 0, Math.sin(player.yaw)).normalize();
+  const right = new THREE.Vector3(-Math.sin(player.yaw), 0, Math.cos(player.yaw)).normalize();
+
+  const moveDirection = new THREE.Vector3();
+  moveDirection.addScaledVector(forward, -mobileInput.left.y); // Vertical stick controls
+  moveDirection.addScaledVector(right, mobileInput.left.x);   // Horizontal stick controls
+
+  const activeSpeed = player.sprinting ? 45 : (player.crouch ? 10 : 22);
+  
+  player.vel.x = moveDirection.x * activeSpeed;
+  player.vel.z = moveDirection.z * activeSpeed;
+
+  // Real-time Gravity Calculations 
+  if (!player.onGround) {
+    player.vel.y -= 45 * dt;
+  }
+
+  player.pos.addScaledVector(player.vel, dt);
+
+  // Ground collision check directly aligned with custom GLB mesh height mapping
+  const currentGroundHeight = getMapHeightAt(player.pos.x, player.pos.z) + 1.5;
+  if (player.pos.y <= currentGroundHeight) {
+    player.pos.y = currentGroundHeight;
+    player.vel.y = 0;
+    player.onGround = true;
+  } else {
+    player.onGround = false;
+  }
+
+  player.mesh.position.copy(player.pos);
+
+  if (mobileInput.firing) {
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    shootHitscan(player.pos, dir, 1200, 3, null);
+  }
+}
+
+function updateBots(dt){
+  bots.forEach(b => {
+    if (!b.alive) return;
+
+    // Simulate drop mechanics
+    const currentFloor = getMapHeightAt(b.pos.x, b.pos.z) + 2.0;
+    if (b.pos.y > currentFloor) {
+      b.pos.y -= 80 * dt; 
+      if (b.pos.y < currentFloor) b.pos.y = currentFloor;
+      b.mesh.position.copy(b.pos);
+      return; 
+    }
+
+    // Set destination choices inside grid positions if idle
+    if (!b.target || Math.random() < 0.01) {
+      if (navPoints.length > 0) {
+        b.target = navPoints[Math.floor(Math.random() * navPoints.length)];
+      }
+    }
+
+    if (b.target) {
+      const dir = new THREE.Vector3().subVectors(b.target, b.pos);
+      dir.y = 0; 
+      const dist = dir.length();
+      
+      if (dist > 4) {
+        dir.normalize();
+        const botSpeed = 10 + b.skill * 15;
+        b.pos.addScaledVector(dir, botSpeed * dt);
+        b.pos.y = getMapHeightAt(b.pos.x, b.pos.z) + 2.0;
+      } else {
+        b.target = null; // Reached point location
+      }
+    }
+
+    b.mesh.position.copy(b.pos);
+
+    // Dynamic engagement range cycles
+    if (player && player.health > 0 && !match.isSpectator) {
+      const distanceToPlayer = b.pos.distanceTo(player.pos);
+      if (distanceToPlayer < (150 + b.skill * 250)) {
+        if (Math.random() < dt * (0.4 + b.skill * 1.5)) {
+          const shootDir = new THREE.Vector3().subVectors(player.pos, b.pos).normalize();
+          shootHitscan(b.pos, shootDir, 800, 6 - b.skill * 4, b);
+        }
+      }
+    }
+  });
+}
+
+function shootHitscan(origin, dir, range, spreadDeg, shooter){
+  const now = performance.now();
+  if (shooter) {
+    if (now - shooter.lastShotTime < 350) return;
+    shooter.lastShotTime = now;
+  } else {
+    if (now - player.lastShotTime < 150) return;
+    player.lastShotTime = now;
+  }
+
+  // Calculate random variations
+  const radSpread = spreadDeg * (Math.PI / 180);
+  const finalDir = dir.clone().add(new THREE.Vector3(rng(-radSpread, radSpread), rng(-radSpread, radSpread), rng(-radSpread, radSpread))).normalize();
+
+  // Draw visible trail laser lines
+  const points = [origin.clone(), origin.clone().addScaledVector(finalDir, range)];
+  const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+  const lineMat = new THREE.LineBasicMaterial({color: shooter ? 0xff5722 : 0x00e676});
+  const line = new THREE.Line(lineGeo, lineMat);
+  scene.add(line);
+  setTimeout(() => scene.remove(line), 60);
+
+  // Collision detection logic
+  if (!shooter) { 
+    for (let i = 0; i < bots.length; i++) {
+      const b = bots[i];
+      if (!b.alive) continue;
+      
+      const botBoundsRadius = 3.5;
+      const toBot = new THREE.Vector3().subVectors(b.pos, origin);
+      const dotValue = toBot.dot(finalDir);
+
+      if (dotValue > 0 && dotValue < range) {
+        const intersectionPoint = origin.clone().addScaledVector(finalDir, dotValue);
+        if (b.pos.distanceTo(intersectionPoint) < botBoundsRadius) {
+          b.health -= 35;
+          if (b.health <= 0) {
+            b.alive = false;
+            scene.remove(b.mesh);
+            match.kills++;
+          }
+          break;
+        }
+      }
+    }
+  } else { 
+    if (match.isSpectator) return;
+    const toPlayer = new THREE.Vector3().subVectors(player.pos, origin);
+    const dotValue = toPlayer.dot(finalDir);
+
+    if (dotValue > 0 && dotValue < range) {
+      const intersectionPoint = origin.clone().addScaledVector(finalDir, dotValue);
+      if (player.pos.distanceTo(intersectionPoint) < 3.0) {
+        player.health -= 8;
+        if (player.health < 0) player.health = 0;
+      }
+    }
+  }
+}
+
+function updatePickups(dt){
+  pickups.forEach((p, idx) => {
+    p.mesh.rotation.y += dt * 1.5;
+    if (!match.isSpectator && player && player.pos.distanceTo(p.pos) < 4.0) {
+      if (p.type === 'MED') player.health = Math.min(100, player.health + 40);
+      scene.remove(p.mesh);
+      pickups.splice(idx, 1);
+    }
+  });
+}
+
+function updateCamera(){
+  if (match.isSpectator) {
+    // Basic auto-orbit overview for viewing custom maps in spectator mode
+    const speed = match.time * 0.05;
+    camera.position.set(Math.cos(speed) * 400, 250, Math.sin(speed) * 400);
+    camera.lookAt(0, 0, 0);
+    return;
+  }
+
+  if (!player) return;
+
+  // Use the calculated input vectors to determine look direction changes
+  player.yaw -= mobileInput.right.x * 0.04;
+  player.pitch = Math.max(-Math.PI/3, Math.min(Math.PI/3, player.pitch + mobileInput.right.y * 0.03));
+  
+  // Clear mobile inputs so the camera remains stable when the user lets go of the screen stick
+  mobileInput.right.x *= 0.5;
+  mobileInput.right.y *= 0.5;
+
+  const targetHeadPosition = player.pos.clone().add(new THREE.Vector3(0, 1.2, 0));
+
+  if (player.cameraMode === 'first') {
+    camera.position.copy(targetHeadPosition);
+    const lookTarget = new THREE.Vector3(
+      Math.cos(player.pitch) * Math.cos(player.yaw),
+      Math.sin(player.pitch),
+      Math.cos(player.pitch) * Math.sin(player.yaw)
+    ).add(targetHeadPosition);
+    camera.lookAt(lookTarget);
+  } else {
+    // Smooth third person tracking
+    const offset = new THREE.Vector3(-Math.cos(player.yaw) * 16, 8, -Math.sin(player.yaw) * 16);
+    camera.position.copy(player.pos).add(offset);
+    camera.lookAt(player.pos.clone().add(new THREE.Vector3(0, 2, 0)));
+  }
+}
+
+// TOUCH CONTROLS
+function setupMobileControls(){
+  const left = document.getElementById('leftStick');
+  const right = document.getElementById('rightStick');
+
+  function handleTouch(e, type) {
+    e.preventDefault();
+    const touch = e.touches[0] || e.changedTouches[0];
+    if (!touch) return;
+
+    const el = type === 'left' ? left : right;
+    const rect = el.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+
+    const dx = (touch.clientX - centerX) / (rect.width / 2);
+    const dy = (touch.clientY - centerY) / (rect.height / 2);
+    const limit = (n) => Math.max(-1, Math.min(1, n));
+
+    if (type === 'left') {
+      mobileInput.left = { x: limit(dx), y: limit(dy) };
+    } else {
+      // Right stick registers continuous swipe changes directly
+      mobileInput.right = { x: limit(dx) * 1.5, y: limit(dy) * -1.5 };
+    }
+  }
+
+  left.addEventListener('touchmove', (e) => handleTouch(e, 'left'), {passive:false});
+  left.addEventListener('touchend', () => mobileInput.left = {x:0, y:0});
+  
+  right.addEventListener('touchmove', (e) => handleTouch(e, 'right'), {passive:false});
+}
+
+function setupButtons(){
+  const fire = document.getElementById('btnFire');
+  fire.addEventListener('touchstart', (e) => { e.preventDefault(); mobileInput.firing = true; });
+  fire.addEventListener('touchend', () => mobileInput.firing = false);
+  
+  // Mouse down support for desktop browsers testing mobile modes
+  fire.addEventListener('mousedown', () => mobileInput.firing = true);
+  fire.addEventListener('mouseup', () => mobileInput.firing = false);
+
+  document.getElementById('btnAim').addEventListener('click', () => {
+    player.cameraMode = player.cameraMode === 'first' ? 'third' : 'first';
+  });
+
+  document.getElementById('btnJump').addEventListener('click', () => {
+    if (player && player.onGround) {
+      player.vel.y = 20;
+      player.onGround = false;
+    }
+  });
+
+  document.getElementById('btnCrouch').addEventListener('click', () => {
+    if(player) player.crouch = !player.crouch;
+  });
+
+  const sprint = document.getElementById('btnSprint');
+  sprint.addEventListener('touchstart', (e) => { e.preventDefault(); player.sprinting = true; });
+  sprint.addEventListener('touchend', () => player.sprinting = false);
+}
+
+function onResize(){
+  if (!camera || !renderer) return;
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+</script>
+</body>
+</html>
